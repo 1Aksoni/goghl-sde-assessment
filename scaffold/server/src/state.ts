@@ -458,22 +458,27 @@ export async function createReply(
   }
 
   const now = new Date();
-  await conversations.updateOne(
-    { workspace, contact },
-    {
-      $setOnInsert: {
-        workspace,
-        contact,
-        assignee: null,
-        closed: false,
-        inbound: [],
-        createdAt: now,
+  try {
+    await conversations.updateOne(
+      { workspace, contact },
+      {
+        $setOnInsert: {
+          workspace,
+          contact,
+          assignee: null,
+          closed: false,
+          inbound: [],
+          createdAt: now,
+        },
+        $set: { updatedAt: now },
+        $max: { lastActivityAt: now },
       },
-      $set: { updatedAt: now },
-      $max: { lastActivityAt: now },
-    },
-    { upsert: true },
-  );
+      { upsert: true },
+    );
+  } catch (error) {
+    if (!isDuplicateKey(error)) throw error;
+    if (!(await conversations.findOne({ workspace, contact }))) throw error;
+  }
 
   const pendingEvent: PendingWorkspaceEvent = {
     sourceKey: `reply:${clientRef}`,

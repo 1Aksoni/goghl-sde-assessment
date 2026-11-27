@@ -111,22 +111,24 @@ app.post(
       return;
     }
 
-    const envelope = webhookEnvelopeSchema.safeParse(payload);
+    const eventType = z.object({ type: z.string() }).safeParse(payload);
+    if (
+      eventType.success &&
+      eventType.data.type !== 'message.inbound' &&
+      eventType.data.type !== 'message.status'
+    ) {
+      res.sendStatus(204);
+      return;
+    }
+
     const workspace = z.object({ workspace: z.string().min(1) }).safeParse(payload);
     if (workspace.success && !isKnownWorkspace(workspace.data.workspace)) {
       res.sendStatus(204);
       return;
     }
+    const envelope = webhookEnvelopeSchema.safeParse(payload);
     if (!envelope.success) {
       jsonError(res, 400, 'INVALID_EVENT', 'Webhook event is missing required fields');
-      return;
-    }
-
-    if (
-      envelope.data.type !== 'message.inbound' &&
-      envelope.data.type !== 'message.status'
-    ) {
-      res.sendStatus(204);
       return;
     }
 

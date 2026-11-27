@@ -253,7 +253,7 @@ button:disabled { cursor: not-allowed; opacity: .56; }
   .workspace-label { display: none; }
   .inbox-heading { margin: 14px 8px 6px; }
   .conversation-list { min-height: 70px; }
-  .profile { display: none; }
+  .profile { padding-top: 8px; }
   .workspace { min-height: 56vh; }
   .topbar { min-height: 55px; padding: 0 15px; }
   .thread-header { align-items: flex-start; flex-direction: column; padding: 14px 16px; }
