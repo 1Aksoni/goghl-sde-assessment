@@ -12,6 +12,8 @@ The reply record doubles as its outbox job because the configured MongoDB is
 standalone; this avoids depending on multi-document transactions. Provider
 status updates are monotonic, and unknown event types/workspaces and statuses
 for unknown replies are acknowledged and ignored as required by Pigeon.
+Concurrent same-reference replies tolerate a conversation upsert collision
+before the unique outbox record is created.
 Focused server integration tests cover claim races, inbound deduplication and
 ordering, and concurrent reply idempotency with terminal status handling.
 
