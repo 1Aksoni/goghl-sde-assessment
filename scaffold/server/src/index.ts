@@ -1,8 +1,17 @@
 import express from 'express';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { z } from 'zod';
+import {
+  beginLogin,
+  endLogin,
+  finishLogin,
+  getRequestSession,
+  isWorkspaceMember,
+  type UserSession,
+} from './auth.js';
 import { config } from './config.js';
+import { startRealtime } from './realtime.js';
 import { closeDb, getDb } from './db.js';
 import { startPigeonWorker } from './pigeon-worker.js';
 import { closeRedis, getRedis } from './redis.js';
@@ -10,11 +19,15 @@ import {
   claimConversation,
   createReply,
   ensureStorageIndexes,
+  getConversationMessages,
   getSnapshot,
   isKnownWorkspace,
+  listConversations,
   processPendingInboundWebhooks,
   processPendingStatusWebhooks,
+  processPendingWorkspaceEvents,
   resetApplicationData,
+  setConversationClosed,
   storeInboundWebhook,
   storeStatusWebhook,
 } from './state.js';
@@ -45,6 +58,13 @@ const replySchema = z.object({
   contact: z.string().min(1),
   text: z.string().min(1),
   client_ref: z.string().min(1),
+});
+
+const workspaceBodySchema = z.object({ workspace: z.string().min(1) });
+const userReplySchema = z.object({
+  workspace: z.string().min(1),
+  text: z.string().min(1),
+  client_ref: z.string().min(1).optional(),
 });
 
 function isValidPigeonSignature(
@@ -130,6 +150,208 @@ app.post(
 );
 
 app.use(express.json());
+
+async function requireWorkspaceSession(
+  req: express.Request,
+  res: express.Response,
+  workspace: string | undefined,
+): Promise<UserSession | null> {
+  let session: UserSession | null;
+  try {
+    session = await getRequestSession(req);
+  } catch (error) {
+    console.error('Could not read login session', error);
+    jsonError(res, 503, 'SESSION_UNAVAILABLE', 'Login session service is unavailable');
+    return null;
+  }
+  if (!session) {
+    jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
+    return null;
+  }
+  if (!workspace) {
+    jsonError(res, 400, 'WORKSPACE_REQUIRED', 'workspace is required');
+    return null;
+  }
+  if (!isWorkspaceMember(session, workspace)) {
+    jsonError(res, 403, 'FORBIDDEN', 'You are not a member of this workspace');
+    return null;
+  }
+  return session;
+}
+
+app.get('/auth/login', async (req, res) => {
+  try {
+    await beginLogin(req, res);
+  } catch (error) {
+    console.error('Could not start OIDC login', error);
+    jsonError(res, 503, 'OIDC_UNAVAILABLE', 'Identity provider is unavailable');
+  }
+});
+
+app.get('/auth/callback', async (req, res) => {
+  try {
+    await finishLogin(req, res);
+  } catch (error) {
+    console.error('OIDC callback failed', error);
+    jsonError(res, 502, 'OIDC_CALLBACK_FAILED', 'Could not complete login');
+  }
+});
+
+app.post('/auth/logout', async (req, res) => {
+  try {
+    await endLogin(req, res);
+  } catch (error) {
+    console.error('Could not end login session', error);
+    jsonError(res, 503, 'SESSION_UNAVAILABLE', 'Could not end login session');
+  }
+});
+
+app.get('/api/me', async (req, res) => {
+  try {
+    const session = await getRequestSession(req);
+    if (!session) {
+      jsonError(res, 401, 'UNAUTHORIZED', 'Login required');
+      return;
+    }
+    res.json({
+      sub: session.sub,
+      workspaces: session.workspaces,
+    });
+  } catch (error) {
+    console.error('Could not read login session', error);
+    jsonError(res, 503, 'SESSION_UNAVAILABLE', 'Login session service is unavailable');
+  }
+});
+
+app.get('/api/conversations', async (req, res) => {
+  const workspace = typeof req.query.workspace === 'string' ? req.query.workspace : undefined;
+  if (!(await requireWorkspaceSession(req, res, workspace))) return;
+  const parsedLimit = req.query.limit === undefined ? 20 : Number(req.query.limit);
+  if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
+    jsonError(res, 400, 'INVALID_LIMIT', 'limit must be a positive integer');
+    return;
+  }
+
+  let before: { lastActivityAt: Date; contact: string } | undefined;
+  if (typeof req.query.before === 'string') {
+    try {
+      const cursor = z.object({
+        lastActivityAt: z.string().datetime({ offset: true }),
+        contact: z.string().min(1),
+      }).parse(JSON.parse(Buffer.from(req.query.before, 'base64url').toString('utf8')));
+      before = { lastActivityAt: new Date(cursor.lastActivityAt), contact: cursor.contact };
+    } catch {
+      jsonError(res, 400, 'INVALID_CURSOR', 'before cursor is invalid');
+      return;
+    }
+  }
+
+  try {
+    const limit = Math.min(parsedLimit, 100);
+    const records = await listConversations(workspace!, limit + 1, before);
+    const hasMore = records.length > limit;
+    const page = hasMore ? records.slice(0, limit) : records;
+    const last = page.at(-1);
+    const nextCursor = hasMore && last
+      ? Buffer.from(JSON.stringify({
+          lastActivityAt: (last.lastActivityAt ?? last.updatedAt).toISOString(),
+          contact: last.contact,
+        })).toString('base64url')
+      : null;
+    res.json({
+      conversations: page.map((conversation) => ({
+        contact: conversation.contact,
+        assignee: conversation.assignee ?? null,
+        closed: conversation.closed,
+        lastActivityAt: (conversation.lastActivityAt ?? conversation.updatedAt).toISOString(),
+        inboundCount: conversation.inbound.length,
+      })),
+      nextCursor,
+    });
+  } catch (error) {
+    console.error('Could not list conversations', error);
+    jsonError(res, 503, 'CONVERSATIONS_UNAVAILABLE', 'Could not load conversations');
+  }
+});
+
+app.get('/api/conversations/:contact/messages', async (req, res) => {
+  const workspace = typeof req.query.workspace === 'string' ? req.query.workspace : undefined;
+  if (!(await requireWorkspaceSession(req, res, workspace))) return;
+  try {
+    const result = await getConversationMessages(workspace!, req.params.contact);
+    if (!result) {
+      jsonError(res, 404, 'CONVERSATION_NOT_FOUND', 'Conversation does not exist');
+      return;
+    }
+    res.json({
+      contact: result.conversation.contact,
+      assignee: result.conversation.assignee ?? null,
+      closed: result.conversation.closed,
+      messages: result.messages,
+    });
+  } catch (error) {
+    console.error('Could not load conversation messages', error);
+    jsonError(res, 503, 'MESSAGES_UNAVAILABLE', 'Could not load conversation messages');
+  }
+});
+
+app.post('/api/conversations/:contact/claim', async (req, res) => {
+  const body = workspaceBodySchema.safeParse(req.body);
+  if (!body.success) {
+    jsonError(res, 400, 'INVALID_REQUEST', 'workspace is required');
+    return;
+  }
+  const session = await requireWorkspaceSession(req, res, body.data.workspace);
+  if (!session) return;
+  try {
+    if (!(await claimConversation(body.data.workspace, req.params.contact, session.sub))) {
+      jsonError(res, 409, 'CONVERSATION_CLAIMED', 'Conversation is held by another agent');
+      return;
+    }
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('Could not claim conversation', error);
+    jsonError(res, 503, 'CLAIM_FAILED', 'Could not claim conversation');
+  }
+});
+
+app.post('/api/conversations/:contact/reply', async (req, res) => {
+  const body = userReplySchema.safeParse(req.body);
+  if (!body.success) {
+    jsonError(res, 400, 'INVALID_REQUEST', 'workspace and text are required');
+    return;
+  }
+  if (!(await requireWorkspaceSession(req, res, body.data.workspace))) return;
+  const clientRef = req.header('idempotency-key') ?? body.data.client_ref ?? randomUUID();
+  try {
+    await createReply(body.data.workspace, req.params.contact, body.data.text, clientRef);
+    res.status(202).json({ client_ref: clientRef, status: 'queued' });
+  } catch (error) {
+    console.error('Could not store conversation reply', error);
+    jsonError(res, 503, 'REPLY_STORAGE_FAILED', 'Could not safely store reply');
+  }
+});
+
+for (const [path, closed] of [['close', true], ['reopen', false]] as const) {
+  app.post(`/api/conversations/:contact/${path}`, async (req, res) => {
+    const body = workspaceBodySchema.safeParse(req.body);
+    if (!body.success) {
+      jsonError(res, 400, 'INVALID_REQUEST', 'workspace is required');
+      return;
+    }
+    if (!(await requireWorkspaceSession(req, res, body.data.workspace))) return;
+    try {
+      if (!(await setConversationClosed(body.data.workspace, req.params.contact, closed))) {
+        jsonError(res, 404, 'CONVERSATION_NOT_FOUND', 'Conversation does not exist');
+        return;
+      }
+      res.sendStatus(200);
+    } catch (error) {
+      console.error(`Could not ${path} conversation`, error);
+      jsonError(res, 503, 'CONVERSATION_UPDATE_FAILED', 'Could not update conversation');
+    }
+  });
+}
 
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true });
@@ -244,11 +466,14 @@ app.post('/__grader/reply', async (req, res) => {
 // A plain http server, so you can attach WebSockets to it.
 const server = createServer(app);
 let stopWorker: (() => Promise<void>) | undefined;
+let stopRealtime: (() => Promise<void>) | undefined;
 
 const start = async () => {
   await ensureStorageIndexes();
   await processPendingInboundWebhooks();
   await processPendingStatusWebhooks();
+  await processPendingWorkspaceEvents();
+  stopRealtime = await startRealtime(server);
   stopWorker = startPigeonWorker();
   server.listen(config.port, () => {
     console.log(`server on http://localhost:${config.port}`);
@@ -261,9 +486,11 @@ const shutdown = async (signal: string) => {
   shuttingDown = true;
   console.log(`received ${signal}, shutting down`);
 
+  const realtimeShutdown = stopRealtime?.();
   server.close(async () => {
     await Promise.allSettled([
       stopWorker?.(),
+      realtimeShutdown,
       closeDb(),
       closeRedis(),
     ]);
