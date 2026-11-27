@@ -887,3 +887,51 @@ Only after inbound and claim behavior are verified should we implement:
 4. `429`, `503`, timeout, and outage retries.
 5. Status webhook processing.
 6. `npm run check`.
+
+---
+
+## Pigeon Inbound and Atomic Claims Implemented
+
+### Prompt
+
+```text
+ok understood , implement it
+```
+
+### Implemented
+
+- Added `POST /webhooks/pigeon` using raw request bytes before JSON middleware.
+- Added strict signature parsing and constant-time HMAC-SHA256 comparison over `<timestamp>.<raw body>`.
+- Rejects missing, malformed, mismatched, and older-than-five-minute signatures with `401`.
+- Returns `400` for valid-signature invalid JSON or malformed inbound events.
+- Acknowledges unknown workspaces and unknown event types with `204` without processing them.
+- Added durable inbound event receipts with unique event-ID and `(workspace, message_id)` indexes.
+- Inbound events use a pending/applied state. A pending event is applied idempotently and replayed on startup, protecting against a crash between receipt persistence and conversation update.
+- Conversations now hold their inbound messages; snapshot output orders message IDs by event time and includes contacts created by claim.
+- Added atomic grader claim behavior:
+  - creates missing conversation;
+  - same agent can claim repeatedly (`200`);
+  - a different holder receives `409`;
+  - unknown workspace receives `400`.
+
+### Verification
+
+- Server strict TypeScript check passed.
+- Server restarted and successfully recovered an inbound receipt left pending from an earlier interrupted test.
+- `npm run inbound` delivered a real simulated Pigeon message.
+- A signed duplicate webhook was sent twice: both returned `204`, while snapshot contained its message ID exactly once.
+- Missing and stale signatures both returned `401`.
+- Valid-signature malformed JSON returned `400`.
+- Valid-signature unknown workspace and unknown event type both returned `204`.
+- Grader claim: new/same-holder claims returned `200`; another holder returned `409`.
+- Six concurrent claim attempts for one contact returned exactly one `200` and five `409`s.
+- Final snapshot showed the expected sole claimant.
+- Stopped the test server after verification.
+
+### Debugging note
+
+The first live event revealed that MongoDB rejects `$setOnInsert.inbound` alongside `$addToSet.inbound` as conflicting updates. Removed the conflicting initialization; `$addToSet` creates the field atomically. The failed request remained durably pending, and startup recovery successfully applied it after the fix.
+
+### Not implemented yet
+
+Outbound reply acceptance/sending, retry jobs, Pigeon status processing, authentication, and WebSockets remain later slices. The complete `npm run check` was not run because the Level 1 reply endpoint is not implemented yet.
